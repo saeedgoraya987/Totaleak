@@ -1,7 +1,6 @@
 {
   "name": "zk-sms-backend",
   "version": "1.0.0",
-  "description": "ZK SMS Enterprise Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
