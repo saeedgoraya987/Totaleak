@@ -1,14 +1,13 @@
 {
-  "name": "zk-sms-backend",
+  "name": "zksms",
   "version": "1.0.0",
-  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "axios": "^1.6.2",
-    "cors": "^2.8.5",
-    "express": "^4.18.2"
+    "@supabase/supabase-js": "2.39.0",
+    "axios": "1.6.2",
+    "cors": "2.8.5",
+    "express": "4.18.2"
   }
 }
