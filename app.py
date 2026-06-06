@@ -1,6 +1,7 @@
 """
 ZK SMS Enterprise Backend - Complete Production Server (Flask)
 3-Tier Access: Admin (full), Agent (clients+numbers), Client (own data only)
+All Supabase .or_() calls replaced with individual queries
 """
 import os
 import sys
@@ -50,7 +51,6 @@ def is_client():
     return getattr(request, 'user_type', '') == 'client'
 
 def get_client_numbers(user):
-    """Get phone numbers allocated to a client"""
     try:
         resp = supabase.table('number_allocations').select('phone_number').eq('client_id', user['id']).eq('status', 'active').execute()
         return [n['phone_number'] for n in (resp.data or [])]
@@ -58,7 +58,6 @@ def get_client_numbers(user):
         return []
 
 def get_agent_numbers(user):
-    """Get phone numbers allocated by an agent"""
     try:
         resp = supabase.table('number_allocations').select('phone_number').eq('manager_id', user['id']).execute()
         return [n['phone_number'] for n in (resp.data or [])]
@@ -72,7 +71,6 @@ def authenticate(f):
         api_key = request.headers.get('x-api-key') or request.args.get('api_key')
         if not api_key:
             return jsonify({'success': False, 'message': 'API key required'}), 401
-        # Try managers (admin + agent)
         try:
             response = supabase.table('managers').select('*').eq('api_key', api_key).eq('status', 'active').single().execute()
             if response.data:
@@ -80,7 +78,6 @@ def authenticate(f):
                 request.user_type = 'manager'
                 return f(*args, **kwargs)
         except: pass
-        # Try clients
         try:
             response = supabase.table('clients').select('*').eq('api_key', api_key).eq('status', 'active').single().execute()
             if response.data:
@@ -178,7 +175,7 @@ def sync_messages_to_db(messages):
 # ==================== HEALTH ====================
 @app.route('/')
 def home():
-    return jsonify({'success': True, 'name': 'ZK SMS Enterprise API', 'version': '5.0.0', 'timestamp': datetime.now().isoformat()})
+    return jsonify({'success': True, 'name': 'ZK SMS Enterprise API', 'version': '5.0.1', 'timestamp': datetime.now().isoformat()})
 
 @app.route('/health')
 def health():
@@ -301,12 +298,10 @@ def sms_messages():
         
         query = supabase.table('sms_messages').select('*', count='exact').order('received_at', desc=True).range(offset, offset + limit - 1)
         
-        # CLIENT: only their allocated numbers
         if is_client():
             cn = get_client_numbers(user)
             if cn: query = query.in_('phone_number', cn)
             else: return jsonify({'success': True, 'data': [], 'pagination': {'total': 0, 'limit': limit, 'offset': offset, 'hasMore': False}})
-        # AGENT: only numbers they allocated
         elif is_agent(user):
             an = get_agent_numbers(user)
             if an: query = query.in_('phone_number', an)
@@ -324,7 +319,6 @@ def sms_messages_live():
     try:
         response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=10)
         messages = response.json().get('data', [])
-        # Filter for client/agent
         user = request.user
         if is_client():
             cn = get_client_numbers(user)
@@ -401,7 +395,7 @@ def dashboard_stats():
             managers_count = supabase.table('managers').select('id', count='exact').eq('parent_id', user['id']).execute().count or 0
             clients_count = supabase.table('clients').select('id', count='exact').eq('agent_id', user['id']).execute().count or 0
             active_clients_count = supabase.table('clients').select('id', count='exact').eq('agent_id', user['id']).eq('status', 'active').execute().count or 0
-        else:  # client
+        else:
             clients_count = len(get_client_numbers(user))
             active_clients_count = clients_count
         
@@ -437,9 +431,7 @@ def get_managers():
         user = request.user
         status = request.args.get('status'); role = request.args.get('role')
         query = supabase.table('managers').select('*', count='exact').order('created_at', desc=True)
-        # Agent sees only their sub-accounts
         if is_agent(user): query = query.eq('parent_id', user['id'])
-        # Client cannot see managers
         if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         if status: query = query.eq('status', status)
         if role: query = query.eq('role', role)
@@ -462,14 +454,18 @@ def create_manager():
         if not username or not password or not email:
             return jsonify({'success': False, 'message': 'Username, password, email required'}), 400
         
-        # Agent can only create 'client' role accounts
         role = data.get('role', 'client')
         if is_agent(user) and role in ['admin', 'agent']:
             return jsonify({'success': False, 'message': 'Agents can only create client accounts'}), 403
         
-        existing = supabase.table('managers').select('id').or_(f'username.eq.{username},email.eq.{email}').limit(1).execute()
-        if existing.data:
-            return jsonify({'success': False, 'message': 'Username or email already exists'}), 400
+        # Check username - FIXED: use separate queries instead of .or_()
+        ucheck = supabase.table('managers').select('id').eq('username', username).execute()
+        if ucheck.data:
+            return jsonify({'success': False, 'message': 'Username already exists'}), 400
+        
+        echeck = supabase.table('managers').select('id').eq('email', email).execute()
+        if echeck.data:
+            return jsonify({'success': False, 'message': 'Email already exists'}), 400
         
         new_manager = {
             'username': username, 'password': password, 'email': email,
@@ -602,7 +598,6 @@ def toggle_client_status(client_id):
 @authenticate
 def get_ranges():
     try:
-        # Admin & Agent can see ranges, clients cannot
         if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         response = supabase.table('sms_ranges').select('*').order('country').execute()
         ranges = response.data or []
@@ -706,7 +701,6 @@ def allocate_number():
         phone_number = data.get('phone_number'); range_id = data.get('range_id')
         client_id = data.get('client_id')
         if not phone_number or not range_id: return jsonify({'success': False, 'message': 'phone_number and range_id required'}), 400
-        # Agent must provide their own client
         if is_agent(user):
             if client_id:
                 cc = supabase.table('clients').select('id').eq('id', client_id).eq('agent_id', user['id']).execute()
@@ -881,7 +875,7 @@ def get_sms_logs():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== SEARCH ====================
+# ==================== SEARCH (FIXED - no .or_()) ====================
 @app.route('/api/search')
 @authenticate
 def search():
@@ -889,12 +883,34 @@ def search():
         query = request.args.get('q', '').strip()
         if not query or len(query) < 2: return jsonify({'success': False, 'message': 'Query too short'}), 400
         results = {'messages': [], 'numbers': [], 'clients': []}
-        msg_resp = supabase.table('sms_messages').select('*').or_(f'phone_number.ilike.%{query}%,message.ilike.%{query}%,client_name.ilike.%{query}%').limit(20).execute()
-        results['messages'] = msg_resp.data or []
-        num_resp = supabase.table('number_allocations').select('*, sms_ranges(country)').ilike('phone_number', f'%{query}%').limit(20).execute()
+        
+        # Search messages by phone
+        msg1 = supabase.table('sms_messages').select('*').ilike('phone_number', f'%{query}%').limit(20).execute()
+        msg2 = supabase.table('sms_messages').select('*').ilike('client_name', f'%{query}%').limit(20).execute()
+        msg3 = supabase.table('sms_messages').select('*').ilike('message', f'%{query}%').limit(20).execute()
+        seen_m = set()
+        messages = []
+        for m in (msg1.data or []) + (msg2.data or []) + (msg3.data or []):
+            if m['id'] not in seen_m:
+                seen_m.add(m['id'])
+                messages.append(m)
+        results['messages'] = messages[:20]
+        
+        # Search numbers
+        num_resp = supabase.table('number_allocations').select('*').ilike('phone_number', f'%{query}%').limit(20).execute()
         results['numbers'] = num_resp.data or []
-        client_resp = supabase.table('clients').select('*').or_(f'name.ilike.%{query}%,email.ilike.%{query}%').limit(10).execute()
-        results['clients'] = client_resp.data or []
+        
+        # Search clients by name and email
+        c1 = supabase.table('clients').select('*').ilike('name', f'%{query}%').limit(10).execute()
+        c2 = supabase.table('clients').select('*').ilike('email', f'%{query}%').limit(10).execute()
+        seen_c = set()
+        clients = []
+        for c in (c1.data or []) + (c2.data or []):
+            if c['id'] not in seen_c:
+                seen_c.add(c['id'])
+                clients.append(c)
+        results['clients'] = clients[:10]
+        
         return jsonify({'success': True, 'data': results})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -921,7 +937,7 @@ def export_messages():
 @require_admin
 def system_info():
     try:
-        return jsonify({'success': True, 'data': {'version': '5.0.0', 'supabase_connected': supabase is not None, 'sms_api_url': SMS_API_URL, 'roles': ['admin', 'agent', 'client']}})
+        return jsonify({'success': True, 'data': {'version': '5.0.1', 'supabase_connected': supabase is not None, 'sms_api_url': SMS_API_URL, 'roles': ['admin', 'agent', 'client']}})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -937,7 +953,7 @@ def server_error(e):
 # ==================== START ====================
 if __name__ == '__main__':
     print('=' * 60)
-    print('🚀 ZK SMS Enterprise Backend Server (Flask) v5.0')
+    print('🚀 ZK SMS Enterprise Backend Server (Flask) v5.0.1')
     print('=' * 60)
     print(f'📡 Port: {PORT}')
     print(f'🗄️  Supabase: {"✅ Connected" if supabase else "❌ Not configured"}')
