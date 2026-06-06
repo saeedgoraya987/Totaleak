@@ -3,12 +3,15 @@ ZK SMS Enterprise Backend - Complete Production Server (Flask)
 Single file implementation with ALL features
 """
 import os
+import sys
+import io
+import csv
 import secrets
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import requests
 from supabase import create_client, Client
@@ -46,7 +49,6 @@ def authenticate(f):
         if not api_key:
             return jsonify({'success': False, 'message': 'API key required. Use x-api-key header or api_key query parameter.'}), 401
         
-        # Try managers table first
         try:
             response = supabase.table('managers').select('*').eq('api_key', api_key).eq('status', 'active').single().execute()
             user = response.data
@@ -57,7 +59,6 @@ def authenticate(f):
         except:
             pass
         
-        # Try clients table
         try:
             response = supabase.table('clients').select('*').eq('api_key', api_key).eq('status', 'active').single().execute()
             user = response.data
@@ -97,14 +98,11 @@ def calculate_sms_stats(messages):
     
     for msg in messages:
         date_str = msg.get('dt') or msg.get('received_at')
-        if not date_str:
-            continue
+        if not date_str: continue
         try:
             msg_date = datetime.fromisoformat(str(date_str).replace('Z', '+00:00'))
-            if msg_date.tzinfo:
-                msg_date = msg_date.replace(tzinfo=None)
-        except:
-            continue
+            if msg_date.tzinfo: msg_date = msg_date.replace(tzinfo=None)
+        except: continue
         
         payout = float(msg.get('payout', 0) or 0)
         client = msg.get('cli') or msg.get('client_name') or 'Unknown'
@@ -118,27 +116,22 @@ def calculate_sms_stats(messages):
         if msg_date >= month_ago:
             stats['month']['count'] += 1
             stats['month']['payout'] += payout
-        
         stats['byClient'][client] = stats['byClient'].get(client, 0) + 1
     
     stats['today']['payout'] = round(stats['today']['payout'], 4)
     stats['week']['payout'] = round(stats['week']['payout'], 4)
     stats['month']['payout'] = round(stats['month']['payout'], 4)
     stats['topClients'] = [{'client': c, 'count': n} for c, n in sorted(stats['byClient'].items(), key=lambda x: x[1], reverse=True)[:10]]
-    
     return stats
 
 def get_top_numbers(messages, limit=10):
     number_stats = {}
     for msg in messages:
         number = msg.get('num') or msg.get('phone_number')
-        if not number:
-            continue
-        if number not in number_stats:
-            number_stats[number] = {'count': 0, 'payout': 0}
+        if not number: continue
+        if number not in number_stats: number_stats[number] = {'count': 0, 'payout': 0}
         number_stats[number]['count'] += 1
         number_stats[number]['payout'] += float(msg.get('payout', 0) or 0)
-    
     return [{'number': n, 'messages': d['count'], 'totalPayout': round(d['payout'], 4)} 
             for n, d in sorted(number_stats.items(), key=lambda x: x[1]['count'], reverse=True)[:limit]]
 
@@ -154,14 +147,11 @@ def get_hourly_breakdown(messages):
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     for msg in messages:
         date_str = msg.get('dt') or msg.get('received_at')
-        if not date_str:
-            continue
+        if not date_str: continue
         try:
             msg_date = datetime.fromisoformat(str(date_str).replace('Z', '+00:00'))
-            if msg_date.tzinfo:
-                msg_date = msg_date.replace(tzinfo=None)
-        except:
-            continue
+            if msg_date.tzinfo: msg_date = msg_date.replace(tzinfo=None)
+        except: continue
         if msg_date >= today:
             hour = msg_date.hour
             hours[hour] = hours.get(hour, 0) + 1
@@ -172,12 +162,9 @@ def sync_messages_to_db(messages):
     for msg in messages:
         try:
             supabase.table('sms_messages').upsert({
-                'phone_number': msg['num'],
-                'client_name': msg['cli'],
-                'message': msg['message'],
-                'payout': float(msg.get('payout', 0) or 0),
-                'status': 'received',
-                'received_at': msg['dt']
+                'phone_number': msg['num'], 'client_name': msg['cli'],
+                'message': msg['message'], 'payout': float(msg.get('payout', 0) or 0),
+                'status': 'received', 'received_at': msg['dt']
             }, on_conflict='phone_number,received_at').execute()
             synced += 1
         except Exception as e:
@@ -198,24 +185,19 @@ def health():
             try:
                 response = supabase.table('managers').select('id').limit(1).execute()
                 db_status = 'connected' if response.data else 'empty'
-            except Exception as e:
-                db_status = f'error: {str(e)}'
+            except Exception as e: db_status = f'error: {str(e)}'
         
         sms_status = 'unknown'
         try:
             resp = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=5)
             sms_status = 'online' if resp.status_code == 200 else 'degraded'
-        except Exception as e:
-            sms_status = f'offline: {str(e)}'
+        except Exception as e: sms_status = f'offline: {str(e)}'
         
         response_time = (datetime.now() - start_time).total_seconds() * 1000
-        
         return jsonify({
-            'success': True,
-            'status': 'healthy' if db_status == 'connected' else 'degraded',
+            'success': True, 'status': 'healthy' if db_status == 'connected' else 'degraded',
             'services': {'database': db_status, 'sms_api': sms_status},
-            'responseTime': f'{response_time:.0f}ms',
-            'timestamp': datetime.now().isoformat()
+            'responseTime': f'{response_time:.0f}ms', 'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -227,13 +209,11 @@ def manager_login():
         data = request.get_json()
         username = (data.get('username') or '').strip()
         password = (data.get('password') or '').strip()
-        
         if not username or not password:
             return jsonify({'success': False, 'message': 'Username and password are required'}), 400
         
         response = supabase.table('managers').select('*').eq('username', username).eq('password', password).eq('status', 'active').single().execute()
         user = response.data
-        
         if not user:
             return jsonify({'success': False, 'message': 'Invalid credentials or account inactive'}), 401
         
@@ -259,6 +239,11 @@ def manager_login():
         logger.error(f"Login error: {e}")
         return jsonify({'success': False, 'message': 'Login failed'}), 500
 
+@app.route('/api/auth/me')
+@authenticate
+def me():
+    return jsonify({'success': True, 'data': {'user': request.user, 'type': getattr(request, 'user_type', 'unknown')}})
+
 # ==================== CLIENT AUTH ROUTES ====================
 @app.route('/api/client/login', methods=['POST'])
 def client_login():
@@ -266,13 +251,11 @@ def client_login():
         data = request.get_json()
         email = (data.get('email') or '').strip()
         password = (data.get('password') or '').strip()
-        
         if not email or not password:
             return jsonify({'success': False, 'message': 'Email and password are required'}), 400
         
         response = supabase.table('clients').select('*').eq('email', email).eq('password', password).eq('status', 'active').single().execute()
         client = response.data
-        
         if not client:
             return jsonify({'success': False, 'message': 'Invalid credentials or account inactive'}), 401
         
@@ -304,7 +287,6 @@ def client_register():
         name = (data.get('name') or '').strip()
         email = (data.get('email') or '').strip()
         password = (data.get('password') or '').strip()
-        
         if not name or not email or not password:
             return jsonify({'success': False, 'message': 'Name, email, and password are required'}), 400
         
@@ -313,34 +295,24 @@ def client_register():
             return jsonify({'success': False, 'message': 'Email already registered'}), 400
         
         api_key = secrets.token_hex(32)
-        
         new_client = {
             'name': name, 'email': email, 'password': password,
             'phone': data.get('phone', ''), 'country': data.get('country', ''),
             'balance': 0, 'status': 'active', 'api_key': api_key,
             'created_at': datetime.now().isoformat(), 'updated_at': datetime.now().isoformat()
         }
-        
         response = supabase.table('clients').insert(new_client).execute()
         client = response.data[0] if response.data else {}
         logger.info(f"✅ New client registered: {email}")
         
         return jsonify({
             'success': True, 'message': 'Registration successful',
-            'data': {'client': {
-                'id': client['id'], 'name': client['name'], 'email': client['email'],
-                'phone': client.get('phone', ''), 'country': client.get('country', ''),
-                'api_key': api_key
-            }}
+            'data': {'client': {'id': client['id'], 'name': client['name'], 'email': client['email'],
+                     'phone': client.get('phone', ''), 'country': client.get('country', ''), 'api_key': api_key}}
         }), 201
     except Exception as e:
         logger.error(f"Client registration error: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
-
-@app.route('/api/auth/me')
-@authenticate
-def me():
-    return jsonify({'success': True, 'data': {'user': request.user, 'type': getattr(request, 'user_type', 'unknown')}})
 
 # ==================== SMS MESSAGES ROUTES ====================
 @app.route('/api/sms/messages')
@@ -358,18 +330,17 @@ def sms_messages():
                 api_response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=10)
                 if api_response.json().get('data'):
                     sync_messages_to_db(api_response.json()['data'])
-            except Exception as e:
-                logger.error(f"Sync error: {e}")
+            except Exception as e: logger.error(f"Sync error: {e}")
         
         query = supabase.table('sms_messages').select('*', count='exact').order('received_at', desc=True).range(offset, offset + limit - 1)
         if number: query = query.eq('phone_number', number)
         if client: query = query.eq('client_name', client)
-        
         response = query.execute()
         
         return jsonify({
             'success': True, 'data': response.data or [],
-            'pagination': {'total': response.count or 0, 'limit': limit, 'offset': offset, 'hasMore': (offset + limit) < (response.count or 0)}
+            'pagination': {'total': response.count or 0, 'limit': limit, 'offset': offset,
+                          'hasMore': (offset + limit) < (response.count or 0)}
         })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -406,7 +377,7 @@ def sms_stats():
         
         return jsonify({
             'success': True,
-            'data': {'overview': stats, 'topNumbers': top_numbers, 'topClients': top_clients, 
+            'data': {'overview': stats, 'topNumbers': top_numbers, 'topClients': top_clients,
                      'hourlyBreakdown': hourly_breakdown, 'lastUpdated': datetime.now().isoformat(),
                      'sources': {'database': len(db_messages), 'liveApi': len(api_messages)}}
         })
@@ -423,7 +394,6 @@ def sms_sync():
             return jsonify({'success': True, 'message': 'No messages to sync', 'synced': 0})
         
         synced = sync_messages_to_db(messages)
-        
         try:
             supabase.table('sms_logs').insert({
                 'to_number': 'SYSTEM', 'message': f'Synced {synced} messages from external API',
@@ -446,14 +416,12 @@ def dashboard_stats():
         sms_ranges_resp = supabase.table('sms_ranges').select('*').execute()
         rate_cards_resp = supabase.table('rate_cards').select('*').order('price').execute()
         recent_messages_resp = supabase.table('sms_messages').select('*').order('received_at', desc=True).limit(50).execute()
-        transactions_resp = supabase.table('transactions').select('*').order('created_at', desc=True).limit(20).execute()
-        sms_logs_resp = supabase.table('sms_logs').select('*').order('created_at', desc=True).limit(20).execute()
         
         sms_stats = calculate_sms_stats(recent_messages_resp.data or [])
         active_ranges = len([r for r in (sms_ranges_resp.data or []) if r.get('status') == 'active'])
         
         dashboard = {
-            'overview': {'totalManagers': managers_count, 'totalClients': clients_count, 
+            'overview': {'totalManagers': managers_count, 'totalClients': clients_count,
                         'activeClients': active_clients_count, 'activeSMSRanges': active_ranges,
                         'totalRateCards': len(rate_cards_resp.data or [])},
             'sms': {'today': sms_stats['today'], 'week': sms_stats['week'], 'month': sms_stats['month'],
@@ -470,8 +438,7 @@ def dashboard_stats():
 @authenticate
 def get_managers():
     try:
-        status = request.args.get('status')
-        role = request.args.get('role')
+        status = request.args.get('status'); role = request.args.get('role')
         query = supabase.table('managers').select('*', count='exact').order('created_at', desc=True)
         if status: query = query.eq('status', status)
         if role: query = query.eq('role', role)
@@ -508,6 +475,19 @@ def create_manager():
         created = response.data[0] if response.data else {}
         safe_data = {k: v for k, v in created.items() if k != 'password'}
         return jsonify({'success': True, 'message': 'Manager created', 'data': safe_data}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/managers/<manager_id>', methods=['PUT'])
+@authenticate
+@require_admin
+def update_manager(manager_id):
+    try:
+        data = request.get_json()
+        data.pop('password', None)
+        data['updated_at'] = datetime.now().isoformat()
+        response = supabase.table('managers').update(data).eq('id', manager_id).execute()
+        return jsonify({'success': True, 'message': 'Manager updated', 'data': response.data[0] if response.data else {}})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -569,7 +549,44 @@ def create_client():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== NUMBER ALLOCATION ROUTES ====================
+@app.route('/api/clients/<client_id>', methods=['PUT'])
+@authenticate
+def update_client(client_id):
+    try:
+        data = request.get_json()
+        updates = {'updated_at': datetime.now().isoformat()}
+        for field in ['name', 'email', 'phone', 'country', 'balance', 'status']:
+            if field in data:
+                updates[field] = float(data[field]) if field == 'balance' else data[field]
+        response = supabase.table('clients').update(updates).eq('id', client_id).execute()
+        return jsonify({'success': True, 'message': 'Client updated', 'data': response.data[0] if response.data else {}})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/clients/<client_id>', methods=['DELETE'])
+@authenticate
+@require_admin
+def delete_client(client_id):
+    try:
+        supabase.table('clients').delete().eq('id', client_id).execute()
+        return jsonify({'success': True, 'message': 'Client deleted'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/clients/<client_id>/status', methods=['PATCH'])
+@authenticate
+def toggle_client_status(client_id):
+    try:
+        data = request.get_json()
+        status = data.get('status')
+        if status not in ['active', 'inactive']:
+            return jsonify({'success': False, 'message': 'Valid status required'}), 400
+        supabase.table('clients').update({'status': status, 'updated_at': datetime.now().isoformat()}).eq('id', client_id).execute()
+        return jsonify({'success': True, 'message': f'Client {status}'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== SMS RANGES CRUD ====================
 @app.route('/api/ranges')
 @authenticate
 def get_ranges():
@@ -600,6 +617,52 @@ def create_range():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/ranges/<range_id>', methods=['PUT'])
+@authenticate
+def update_range(range_id):
+    try:
+        data = request.get_json()
+        response = supabase.table('sms_ranges').update(data).eq('id', range_id).execute()
+        return jsonify({'success': True, 'message': 'Range updated', 'data': response.data[0] if response.data else {}})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/ranges/<range_id>', methods=['DELETE'])
+@authenticate
+@require_admin
+def delete_range(range_id):
+    try:
+        allocated = supabase.table('number_allocations').select('id', count='exact').eq('range_id', range_id).eq('status', 'active').execute()
+        if allocated.count and allocated.count > 0:
+            return jsonify({'success': False, 'message': f'Cannot delete range with {allocated.count} active allocations'}), 400
+        supabase.table('sms_ranges').delete().eq('id', range_id).execute()
+        return jsonify({'success': True, 'message': 'Range deleted'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/ranges/<range_id>/status', methods=['PATCH'])
+@authenticate
+def toggle_range_status(range_id):
+    try:
+        data = request.get_json()
+        status = data.get('status')
+        if status not in ['active', 'inactive']:
+            return jsonify({'success': False, 'message': 'Valid status required'}), 400
+        supabase.table('sms_ranges').update({'status': status}).eq('id', range_id).execute()
+        return jsonify({'success': True, 'message': f'Range {status}'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/sms-ranges')
+@authenticate
+def get_sms_ranges():
+    try:
+        response = supabase.table('sms_ranges').select('*').order('created_at', desc=True).execute()
+        return jsonify({'success': True, 'data': response.data or []})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== NUMBER ALLOCATION ====================
 @app.route('/api/numbers/available')
 @authenticate
 def get_available_numbers():
@@ -617,15 +680,13 @@ def get_available_numbers():
         allocated_resp = supabase.table('number_allocations').select('phone_number').eq('range_id', range_id).eq('status', 'active').execute()
         allocated_set = set(a['phone_number'] for a in (allocated_resp.data or []))
         
-        start = int(sms_range['start_number'])
-        end = int(sms_range['end_number'])
+        start = int(sms_range['start_number']); end = int(sms_range['end_number'])
         available = []
         for num in range(start, end + 1):
             num_str = str(num)
             if num_str not in allocated_set:
                 available.append({'phone_number': num_str, 'country': sms_range['country'], 'range_id': sms_range['id']})
-                if len(available) >= limit:
-                    break
+                if len(available) >= limit: break
         
         return jsonify({'success': True, 'data': available, 'total_available': (end - start + 1) - len(allocated_set)})
     except Exception as e:
@@ -636,14 +697,12 @@ def get_available_numbers():
 def allocate_number():
     try:
         data = request.get_json()
-        phone_number = data.get('phone_number')
-        range_id = data.get('range_id')
+        phone_number = data.get('phone_number'); range_id = data.get('range_id')
         client_id = data.get('client_id')
         
         if not phone_number or not range_id:
             return jsonify({'success': False, 'message': 'phone_number and range_id required'}), 400
         
-        # If client is allocating for themselves
         if not client_id and getattr(request, 'user_type', '') == 'client':
             client_id = request.user.get('id')
         
@@ -657,13 +716,6 @@ def allocate_number():
             'status': 'active', 'allocated_at': datetime.now().isoformat()
         }
         response = supabase.table('number_allocations').insert(allocation).execute()
-        
-        # Update range count using raw SQL
-        try:
-            supabase.rpc('increment_allocated', {'range_id': range_id}).execute()
-        except:
-            pass
-        
         return jsonify({'success': True, 'message': f'Number {phone_number} allocated', 'data': response.data[0] if response.data else {}}), 201
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -673,8 +725,7 @@ def allocate_number():
 def allocate_numbers_bulk():
     try:
         data = request.get_json()
-        range_id = data.get('range_id')
-        client_id = data.get('client_id')
+        range_id = data.get('range_id'); client_id = data.get('client_id')
         count = int(data.get('count', 1))
         
         if not range_id or count < 1:
@@ -691,10 +742,8 @@ def allocate_numbers_bulk():
         allocated_resp = supabase.table('number_allocations').select('phone_number').eq('range_id', range_id).eq('status', 'active').execute()
         allocated_set = set(a['phone_number'] for a in (allocated_resp.data or []))
         
-        start = int(sms_range['start_number'])
-        end = int(sms_range['end_number'])
+        start = int(sms_range['start_number']); end = int(sms_range['end_number'])
         allocated_list = []
-        
         for num in range(start, end + 1):
             num_str = str(num)
             if num_str not in allocated_set:
@@ -704,8 +753,7 @@ def allocate_numbers_bulk():
                     'status': 'active', 'allocated_at': datetime.now().isoformat()
                 })
                 allocated_set.add(num_str)
-                if len(allocated_list) >= count:
-                    break
+                if len(allocated_list) >= count: break
         
         if not allocated_list:
             return jsonify({'success': False, 'message': 'No available numbers in this range'}), 400
@@ -723,7 +771,6 @@ def get_my_numbers():
             response = supabase.table('number_allocations').select('*, sms_ranges(country)').eq('client_id', request.user['id']).order('allocated_at', desc=True).execute()
         else:
             response = supabase.table('number_allocations').select('*, sms_ranges(country)').order('allocated_at', desc=True).execute()
-        
         return jsonify({'success': True, 'data': response.data or [], 'total': len(response.data or [])})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
@@ -734,6 +781,24 @@ def release_number(phone_number):
     try:
         supabase.table('number_allocations').update({'status': 'released', 'notes': 'Released by user'}).eq('phone_number', phone_number).execute()
         return jsonify({'success': True, 'message': f'Number {phone_number} released'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/numbers/release/bulk', methods=['POST'])
+@authenticate
+def release_numbers_bulk():
+    try:
+        data = request.get_json()
+        phone_numbers = data.get('phone_numbers', [])
+        if not phone_numbers:
+            return jsonify({'success': False, 'message': 'phone_numbers list required'}), 400
+        released = 0
+        for number in phone_numbers:
+            try:
+                supabase.table('number_allocations').update({'status': 'released', 'notes': 'Bulk release'}).eq('phone_number', number).execute()
+                released += 1
+            except: pass
+        return jsonify({'success': True, 'message': f'{released} numbers released', 'released': released})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -752,21 +817,11 @@ def number_stats():
                 'allocated': allocated.count or 0,
                 'available': (r.get('total_numbers', 0) or 0) - (allocated.count or 0)
             })
-        
         return jsonify({'success': True, 'data': {'total_allocations': total.count or 0, 'active_allocations': active.count or 0, 'by_country': stats}})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== SMS RANGES & RATE CARDS ====================
-@app.route('/api/sms-ranges')
-@authenticate
-def get_sms_ranges():
-    try:
-        response = supabase.table('sms_ranges').select('*').order('created_at', desc=True).execute()
-        return jsonify({'success': True, 'data': response.data or []})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)}), 500
-
+# ==================== RATE CARDS ====================
 @app.route('/api/rate-cards')
 @authenticate
 def get_rate_cards():
@@ -776,36 +831,122 @@ def get_rate_cards():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== TRANSACTIONS & LOGS ====================
+# ==================== TRANSACTIONS ====================
 @app.route('/api/transactions')
 @authenticate
 def get_transactions():
     try:
-        status = request.args.get('status')
-        tx_type = request.args.get('type')
-        client_id = request.args.get('client_id')
-        limit = int(request.args.get('limit', 50))
-        
+        status = request.args.get('status'); tx_type = request.args.get('type')
+        client_id = request.args.get('client_id'); limit = int(request.args.get('limit', 50))
         query = supabase.table('transactions').select('*', count='exact').order('created_at', desc=True).limit(limit)
         if status: query = query.eq('status', status)
         if tx_type: query = query.eq('type', tx_type)
         if client_id: query = query.eq('client_id', client_id)
-        
         response = query.execute()
         return jsonify({'success': True, 'data': response.data or [], 'total': response.count or 0})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
+@app.route('/api/transactions', methods=['POST'])
+@authenticate
+def create_transaction():
+    try:
+        data = request.get_json()
+        transaction = {
+            'type': data.get('type', 'payment'), 'description': data.get('description', ''),
+            'amount': float(data.get('amount', 0) or 0), 'currency': data.get('currency', 'USD'),
+            'status': data.get('status', 'pending'), 'client_id': data.get('client_id'),
+            'manager_id': request.user['id'], 'due_date': data.get('due_date'),
+            'created_at': datetime.now().isoformat()
+        }
+        response = supabase.table('transactions').insert(transaction).execute()
+        return jsonify({'success': True, 'message': 'Transaction created', 'data': response.data[0] if response.data else {}}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/transactions/<transaction_id>', methods=['PATCH'])
+@authenticate
+def update_transaction(transaction_id):
+    try:
+        data = request.get_json()
+        updates = {}
+        if 'status' in data: updates['status'] = data['status']
+        if data.get('status') == 'paid': updates['paid_at'] = datetime.now().isoformat()
+        response = supabase.table('transactions').update(updates).eq('id', transaction_id).execute()
+        return jsonify({'success': True, 'message': 'Transaction updated', 'data': response.data[0] if response.data else {}})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== SMS LOGS ====================
 @app.route('/api/sms-logs')
 @authenticate
 def get_sms_logs():
     try:
-        status = request.args.get('status')
-        limit = int(request.args.get('limit', 50))
+        status = request.args.get('status'); limit = int(request.args.get('limit', 50))
         query = supabase.table('sms_logs').select('*').order('created_at', desc=True).limit(limit)
         if status: query = query.eq('status', status)
         response = query.execute()
         return jsonify({'success': True, 'data': response.data or []})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== SEARCH ====================
+@app.route('/api/search')
+@authenticate
+def search():
+    try:
+        query = request.args.get('q', '').strip()
+        if not query or len(query) < 2:
+            return jsonify({'success': False, 'message': 'Search query too short'}), 400
+        results = {'messages': [], 'numbers': [], 'clients': []}
+        msg_resp = supabase.table('sms_messages').select('*').or_(f'phone_number.ilike.%{query}%,message.ilike.%{query}%,client_name.ilike.%{query}%').limit(20).execute()
+        results['messages'] = msg_resp.data or []
+        num_resp = supabase.table('number_allocations').select('*, sms_ranges(country)').ilike('phone_number', f'%{query}%').limit(20).execute()
+        results['numbers'] = num_resp.data or []
+        client_resp = supabase.table('clients').select('*').or_(f'name.ilike.%{query}%,email.ilike.%{query}%').limit(10).execute()
+        results['clients'] = client_resp.data or []
+        return jsonify({'success': True, 'data': results})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== EXPORT ====================
+@app.route('/api/export/messages')
+@authenticate
+def export_messages():
+    try:
+        response = supabase.table('sms_messages').select('*').order('received_at', desc=True).limit(1000).execute()
+        messages = response.data or []
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Phone Number', 'Client', 'Message', 'Payout', 'Status', 'Received At'])
+        for msg in messages:
+            writer.writerow([msg.get('phone_number', ''), msg.get('client_name', ''), msg.get('message', ''),
+                           msg.get('payout', ''), msg.get('status', ''), msg.get('received_at', '')])
+        return Response(output.getvalue(), mimetype='text/csv',
+                       headers={'Content-Disposition': 'attachment;filename=sms_messages.csv'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# ==================== SYSTEM INFO ====================
+@app.route('/api/system/info')
+@authenticate
+@require_admin
+def system_info():
+    try:
+        info = {
+            'version': '4.0.0', 'supabase_connected': supabase is not None,
+            'sms_api_url': SMS_API_URL, 'endpoints': [
+                '/api/auth/login', '/api/client/login', '/api/client/register',
+                '/api/sms/messages', '/api/sms/messages/live', '/api/sms/stats', '/api/sms/sync',
+                '/api/dashboard/stats', '/api/managers', '/api/clients',
+                '/api/ranges', '/api/sms-ranges', '/api/numbers/available',
+                '/api/numbers/allocate', '/api/numbers/allocate/bulk', '/api/numbers/my-numbers',
+                '/api/numbers/release', '/api/numbers/release/bulk', '/api/numbers/stats',
+                '/api/rate-cards', '/api/transactions', '/api/sms-logs',
+                '/api/search', '/api/export/messages', '/api/system/info'
+            ]
+        }
+        return jsonify({'success': True, 'data': info})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
