@@ -1,7 +1,7 @@
 """
 ZK SMS Enterprise Backend - Complete Production Server (Flask)
 3-Tier Access: Admin (full), Agent (clients+numbers), Client (own data only)
-All Supabase .or_() calls replaced with individual queries
+SMS messages automatically filtered by user's allocated numbers
 """
 import os
 import sys
@@ -47,10 +47,11 @@ def is_admin(user):
 def is_agent(user):
     return user.get('role') == 'agent'
 
-def is_client():
+def is_client_user():
     return getattr(request, 'user_type', '') == 'client'
 
 def get_client_numbers(user):
+    """Get phone numbers allocated to a client"""
     try:
         resp = supabase.table('number_allocations').select('phone_number').eq('client_id', user['id']).eq('status', 'active').execute()
         return [n['phone_number'] for n in (resp.data or [])]
@@ -58,11 +59,28 @@ def get_client_numbers(user):
         return []
 
 def get_agent_numbers(user):
+    """Get phone numbers allocated by an agent"""
     try:
         resp = supabase.table('number_allocations').select('phone_number').eq('manager_id', user['id']).execute()
         return [n['phone_number'] for n in (resp.data or [])]
     except:
         return []
+
+def get_user_numbers(user):
+    """Get allowed phone numbers for current user"""
+    if is_admin(user):
+        return []  # Empty means ALL
+    elif is_agent(user):
+        return get_agent_numbers(user)
+    elif is_client_user():
+        return get_client_numbers(user)
+    return []
+
+def filter_messages_by_numbers(messages, allowed_numbers):
+    """Filter messages to only show those matching allowed numbers"""
+    if not allowed_numbers:
+        return messages  # Admin sees all
+    return [m for m in messages if (m.get('num') or m.get('phone_number')) in allowed_numbers]
 
 # ==================== AUTH MIDDLEWARE ====================
 def authenticate(f):
@@ -160,6 +178,7 @@ def get_hourly_breakdown(messages):
     return [{'hour': f'{h}:00', 'count': c} for h, c in sorted(hours.items())]
 
 def sync_messages_to_db(messages):
+    """Sync messages to database"""
     synced = 0
     for msg in messages:
         try:
@@ -172,10 +191,22 @@ def sync_messages_to_db(messages):
         except: pass
     return synced
 
+def fetch_all_sms_from_api():
+    """Fetch ALL SMS from external API"""
+    try:
+        response = requests.get(SMS_API_URL, params={
+            'token': SMS_API_TOKEN,
+            'records': 1000
+        }, timeout=15)
+        return response.json().get('data', [])
+    except Exception as e:
+        logger.error(f"SMS API fetch error: {e}")
+        return []
+
 # ==================== HEALTH ====================
 @app.route('/')
 def home():
-    return jsonify({'success': True, 'name': 'ZK SMS Enterprise API', 'version': '5.0.1', 'timestamp': datetime.now().isoformat()})
+    return jsonify({'success': True, 'name': 'ZK SMS Enterprise API', 'version': '5.1.0', 'timestamp': datetime.now().isoformat()})
 
 @app.route('/health')
 def health():
@@ -278,7 +309,7 @@ def client_register():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== SMS MESSAGES (Role-filtered) ====================
+# ==================== SMS MESSAGES (Auto-filtered by user's numbers) ====================
 @app.route('/api/sms/messages')
 @authenticate
 def sms_messages():
@@ -290,101 +321,155 @@ def sms_messages():
         client = request.args.get('client')
         refresh = request.args.get('refresh', 'false').lower() == 'true'
         
+        # Get allowed numbers for this user
+        allowed_numbers = get_user_numbers(user)
+        
+        # If refresh, sync from API first
         if refresh:
             try:
-                api_response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=10)
-                if api_response.json().get('data'): sync_messages_to_db(api_response.json()['data'])
-            except: pass
+                all_messages = fetch_all_sms_from_api()
+                # Filter by user's numbers before syncing
+                filtered = filter_messages_by_numbers(all_messages, allowed_numbers)
+                if filtered:
+                    sync_messages_to_db(filtered)
+            except Exception as e:
+                logger.error(f"Refresh error: {e}")
         
+        # Query from database
         query = supabase.table('sms_messages').select('*', count='exact').order('received_at', desc=True).range(offset, offset + limit - 1)
         
-        if is_client():
-            cn = get_client_numbers(user)
-            if cn: query = query.in_('phone_number', cn)
-            else: return jsonify({'success': True, 'data': [], 'pagination': {'total': 0, 'limit': limit, 'offset': offset, 'hasMore': False}})
-        elif is_agent(user):
-            an = get_agent_numbers(user)
-            if an: query = query.in_('phone_number', an)
+        # Filter by allowed numbers for agent/client
+        if allowed_numbers:
+            query = query.in_('phone_number', allowed_numbers)
         
-        if number: query = query.eq('phone_number', number)
-        if client: query = query.eq('client_name', client)
+        if number:
+            query = query.eq('phone_number', number)
+        if client:
+            query = query.eq('client_name', client)
+        
         response = query.execute()
-        return jsonify({'success': True, 'data': response.data or [], 'pagination': {'total': response.count or 0, 'limit': limit, 'offset': offset, 'hasMore': (offset + limit) < (response.count or 0)}})
+        return jsonify({
+            'success': True,
+            'data': response.data or [],
+            'pagination': {
+                'total': response.count or 0,
+                'limit': limit,
+                'offset': offset,
+                'hasMore': (offset + limit) < (response.count or 0)
+            }
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/sms/messages/live')
 @authenticate
 def sms_messages_live():
+    """Get live SMS - automatically filtered by user's numbers"""
     try:
-        response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=10)
-        messages = response.json().get('data', [])
         user = request.user
-        if is_client():
-            cn = get_client_numbers(user)
-            messages = [m for m in messages if m.get('num') in cn]
-        elif is_agent(user):
-            an = get_agent_numbers(user)
-            messages = [m for m in messages if m.get('num') in an]
-        return jsonify({'success': True, 'source': 'api', 'data': messages, 'total': len(messages)})
+        all_messages = fetch_all_sms_from_api()
+        allowed_numbers = get_user_numbers(user)
+        filtered = filter_messages_by_numbers(all_messages, allowed_numbers)
+        
+        return jsonify({
+            'success': True,
+            'source': 'api',
+            'data': filtered,
+            'total': len(filtered),
+            'total_api': len(all_messages)
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/sms/stats')
 @authenticate
 def sms_stats():
+    """SMS stats - automatically filtered by user's numbers"""
     try:
         user = request.user
+        allowed_numbers = get_user_numbers(user)
+        
         thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
         query = supabase.table('sms_messages').select('*').gte('received_at', thirty_days_ago).order('received_at', desc=True)
-        if is_client():
-            cn = get_client_numbers(user)
-            if cn: query = query.in_('phone_number', cn)
-        elif is_agent(user):
-            an = get_agent_numbers(user)
-            if an: query = query.in_('phone_number', an)
+        
+        if allowed_numbers:
+            query = query.in_('phone_number', allowed_numbers)
+        
         db_messages = query.execute().data or []
         
+        # Fetch live API messages and filter
         api_messages = []
         try:
-            api_response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=5)
-            api_messages = api_response.json().get('data', [])
-            if is_client():
-                cn = get_client_numbers(user)
-                api_messages = [m for m in api_messages if m.get('num') in cn]
-            elif is_agent(user):
-                an = get_agent_numbers(user)
-                api_messages = [m for m in api_messages if m.get('num') in an]
-        except: pass
+            all_api = fetch_all_sms_from_api()
+            api_messages = filter_messages_by_numbers(all_api, allowed_numbers)
+        except:
+            pass
         
         all_messages = db_messages + api_messages
         stats = calculate_sms_stats(all_messages)
-        return jsonify({'success': True, 'data': {'overview': stats, 'topNumbers': get_top_numbers(all_messages, 10), 'topClients': get_top_clients(all_messages, 5), 'hourlyBreakdown': get_hourly_breakdown(all_messages), 'lastUpdated': datetime.now().isoformat(), 'sources': {'database': len(db_messages), 'liveApi': len(api_messages)}}})
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'overview': stats,
+                'topNumbers': get_top_numbers(all_messages, 10),
+                'topClients': get_top_clients(all_messages, 5),
+                'hourlyBreakdown': get_hourly_breakdown(all_messages),
+                'lastUpdated': datetime.now().isoformat(),
+                'sources': {'database': len(db_messages), 'liveApi': len(api_messages)}
+            }
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+
 
 @app.route('/api/sms/sync', methods=['POST'])
 @authenticate
 @require_agent_or_admin
 def sms_sync():
+    """Sync SMS - filtered by user's numbers for agent"""
     try:
-        response = requests.get(SMS_API_URL, params={'token': SMS_API_TOKEN}, timeout=10)
-        messages = response.json().get('data', [])
-        if not messages: return jsonify({'success': True, 'message': 'No messages', 'synced': 0})
-        synced = sync_messages_to_db(messages)
+        user = request.user
+        all_messages = fetch_all_sms_from_api()
+        allowed_numbers = get_user_numbers(user)
+        filtered = filter_messages_by_numbers(all_messages, allowed_numbers)
+        
+        if not filtered:
+            return jsonify({'success': True, 'message': 'No messages to sync', 'synced': 0})
+        
+        synced = sync_messages_to_db(filtered)
+        
         try:
-            supabase.table('sms_logs').insert({'to_number': 'SYSTEM', 'message': f'Synced {synced} messages', 'status': 'synced', 'manager_id': request.user['id'], 'created_at': datetime.now().isoformat()}).execute()
-        except: pass
-        return jsonify({'success': True, 'message': f'Synced {synced}', 'synced': synced, 'total': len(messages)})
+            supabase.table('sms_logs').insert({
+                'to_number': 'SYSTEM',
+                'message': f'Synced {synced} messages',
+                'status': 'synced',
+                'manager_id': user['id'],
+                'created_at': datetime.now().isoformat()
+            }).execute()
+        except:
+            pass
+        
+        return jsonify({
+            'success': True,
+            'message': f'Synced {synced} messages',
+            'synced': synced,
+            'total': len(filtered),
+            'total_api': len(all_messages)
+        })
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== DASHBOARD (Role-filtered) ====================
+
+# ==================== DASHBOARD ====================
 @app.route('/api/dashboard/stats')
 @authenticate
 def dashboard_stats():
     try:
         user = request.user
+        allowed_numbers = get_user_numbers(user)
         managers_count = clients_count = active_clients_count = 0
         
         if is_admin(user):
@@ -396,27 +481,36 @@ def dashboard_stats():
             clients_count = supabase.table('clients').select('id', count='exact').eq('agent_id', user['id']).execute().count or 0
             active_clients_count = supabase.table('clients').select('id', count='exact').eq('agent_id', user['id']).eq('status', 'active').execute().count or 0
         else:
-            clients_count = len(get_client_numbers(user))
+            clients_count = len(allowed_numbers)
             active_clients_count = clients_count
         
         sms_ranges_resp = supabase.table('sms_ranges').select('*').execute()
         rate_cards_resp = supabase.table('rate_cards').select('*').order('price').execute()
         
         msg_query = supabase.table('sms_messages').select('*').order('received_at', desc=True).limit(50)
-        if is_client():
-            cn = get_client_numbers(user)
-            if cn: msg_query = msg_query.in_('phone_number', cn)
-        elif is_agent(user):
-            an = get_agent_numbers(user)
-            if an: msg_query = msg_query.in_('phone_number', an)
+        if allowed_numbers:
+            msg_query = msg_query.in_('phone_number', allowed_numbers)
         
         recent_messages_resp = msg_query.execute()
         sms_stats = calculate_sms_stats(recent_messages_resp.data or [])
         active_ranges = len([r for r in (sms_ranges_resp.data or []) if r.get('status') == 'active'])
         
         dashboard = {
-            'overview': {'totalManagers': managers_count, 'totalClients': clients_count, 'activeClients': active_clients_count, 'activeSMSRanges': active_ranges, 'totalRateCards': len(rate_cards_resp.data or [])},
-            'sms': {'today': sms_stats['today'], 'week': sms_stats['week'], 'month': sms_stats['month'], 'allTime': sms_stats['total'], 'topClients': sms_stats['topClients'], 'recentMessages': (recent_messages_resp.data or [])[:10]},
+            'overview': {
+                'totalManagers': managers_count,
+                'totalClients': clients_count,
+                'activeClients': active_clients_count,
+                'activeSMSRanges': active_ranges,
+                'totalRateCards': len(rate_cards_resp.data or [])
+            },
+            'sms': {
+                'today': sms_stats['today'],
+                'week': sms_stats['week'],
+                'month': sms_stats['month'],
+                'allTime': sms_stats['total'],
+                'topClients': sms_stats['topClients'],
+                'recentMessages': (recent_messages_resp.data or [])[:10]
+            },
             'lastUpdated': datetime.now().isoformat()
         }
         return jsonify({'success': True, 'data': dashboard})
@@ -432,7 +526,7 @@ def get_managers():
         status = request.args.get('status'); role = request.args.get('role')
         query = supabase.table('managers').select('*', count='exact').order('created_at', desc=True)
         if is_agent(user): query = query.eq('parent_id', user['id'])
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         if status: query = query.eq('status', status)
         if role: query = query.eq('role', role)
         response = query.execute()
@@ -458,7 +552,6 @@ def create_manager():
         if is_agent(user) and role in ['admin', 'agent']:
             return jsonify({'success': False, 'message': 'Agents can only create client accounts'}), 403
         
-        # Check username - FIXED: use separate queries instead of .or_()
         ucheck = supabase.table('managers').select('id').eq('username', username).execute()
         if ucheck.data:
             return jsonify({'success': False, 'message': 'Username already exists'}), 400
@@ -525,7 +618,7 @@ def delete_manager(manager_id):
 def get_clients():
     try:
         user = request.user
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         status = request.args.get('status')
         query = supabase.table('clients').select('*').order('created_at', desc=True)
         if is_agent(user): query = query.eq('agent_id', user['id'])
@@ -598,7 +691,7 @@ def toggle_client_status(client_id):
 @authenticate
 def get_ranges():
     try:
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         response = supabase.table('sms_ranges').select('*').order('country').execute()
         ranges = response.data or []
         for r in ranges:
@@ -625,7 +718,7 @@ def create_range():
 @authenticate
 def get_sms_ranges():
     try:
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         response = supabase.table('sms_ranges').select('*').order('created_at', desc=True).execute()
         return jsonify({'success': True, 'data': response.data or []})
     except Exception as e:
@@ -672,7 +765,7 @@ def toggle_range_status(range_id):
 @authenticate
 def get_available_numbers():
     try:
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         range_id = request.args.get('range_id'); limit = int(request.args.get('limit', 20))
         if not range_id: return jsonify({'success': False, 'message': 'range_id required'}), 400
         range_resp = supabase.table('sms_ranges').select('*').eq('id', range_id).single().execute()
@@ -754,7 +847,7 @@ def allocate_numbers_bulk():
 def get_my_numbers():
     try:
         user = request.user
-        if is_client():
+        if is_client_user():
             response = supabase.table('number_allocations').select('*, sms_ranges(country)').eq('client_id', user['id']).order('allocated_at', desc=True).execute()
         elif is_agent(user):
             response = supabase.table('number_allocations').select('*, sms_ranges(country)').eq('manager_id', user['id']).order('allocated_at', desc=True).execute()
@@ -790,21 +883,6 @@ def release_numbers_bulk():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-@app.route('/api/numbers/stats')
-@authenticate
-def number_stats():
-    try:
-        total = supabase.table('number_allocations').select('id', count='exact').execute()
-        active = supabase.table('number_allocations').select('id', count='exact').eq('status', 'active').execute()
-        ranges = supabase.table('sms_ranges').select('*').execute()
-        stats = []
-        for r in (ranges.data or []):
-            allocated = supabase.table('number_allocations').select('id', count='exact').eq('range_id', r['id']).eq('status', 'active').execute()
-            stats.append({'country': r['country'], 'total': r.get('total_numbers', 0), 'allocated': allocated.count or 0, 'available': (r.get('total_numbers', 0) or 0) - (allocated.count or 0)})
-        return jsonify({'success': True, 'data': {'total_allocations': total.count or 0, 'active_allocations': active.count or 0, 'by_country': stats}})
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)}), 500
-
 # ==================== RATE CARDS ====================
 @app.route('/api/rate-cards')
 @authenticate
@@ -824,7 +902,7 @@ def get_transactions():
         status = request.args.get('status'); tx_type = request.args.get('type')
         client_id = request.args.get('client_id'); limit = int(request.args.get('limit', 50))
         query = supabase.table('transactions').select('*', count='exact').order('created_at', desc=True).limit(limit)
-        if is_client(): query = query.eq('client_id', user['id'])
+        if is_client_user(): query = query.eq('client_id', user['id'])
         elif is_agent(user): query = query.eq('manager_id', user['id'])
         if status: query = query.eq('status', status)
         if tx_type: query = query.eq('type', tx_type)
@@ -865,7 +943,7 @@ def update_transaction(transaction_id):
 def get_sms_logs():
     try:
         user = request.user
-        if is_client(): return jsonify({'success': False, 'message': 'Access denied'}), 403
+        if is_client_user(): return jsonify({'success': False, 'message': 'Access denied'}), 403
         status = request.args.get('status'); limit = int(request.args.get('limit', 50))
         query = supabase.table('sms_logs').select('*').order('created_at', desc=True).limit(limit)
         if is_agent(user): query = query.eq('manager_id', user['id'])
@@ -875,7 +953,7 @@ def get_sms_logs():
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
-# ==================== SEARCH (FIXED - no .or_()) ====================
+# ==================== SEARCH ====================
 @app.route('/api/search')
 @authenticate
 def search():
@@ -884,7 +962,6 @@ def search():
         if not query or len(query) < 2: return jsonify({'success': False, 'message': 'Query too short'}), 400
         results = {'messages': [], 'numbers': [], 'clients': []}
         
-        # Search messages by phone
         msg1 = supabase.table('sms_messages').select('*').ilike('phone_number', f'%{query}%').limit(20).execute()
         msg2 = supabase.table('sms_messages').select('*').ilike('client_name', f'%{query}%').limit(20).execute()
         msg3 = supabase.table('sms_messages').select('*').ilike('message', f'%{query}%').limit(20).execute()
@@ -896,11 +973,9 @@ def search():
                 messages.append(m)
         results['messages'] = messages[:20]
         
-        # Search numbers
         num_resp = supabase.table('number_allocations').select('*').ilike('phone_number', f'%{query}%').limit(20).execute()
         results['numbers'] = num_resp.data or []
         
-        # Search clients by name and email
         c1 = supabase.table('clients').select('*').ilike('name', f'%{query}%').limit(10).execute()
         c2 = supabase.table('clients').select('*').ilike('email', f'%{query}%').limit(10).execute()
         seen_c = set()
@@ -937,7 +1012,7 @@ def export_messages():
 @require_admin
 def system_info():
     try:
-        return jsonify({'success': True, 'data': {'version': '5.0.1', 'supabase_connected': supabase is not None, 'sms_api_url': SMS_API_URL, 'roles': ['admin', 'agent', 'client']}})
+        return jsonify({'success': True, 'data': {'version': '5.1.0', 'supabase_connected': supabase is not None, 'sms_api_url': SMS_API_URL, 'roles': ['admin', 'agent', 'client']}})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -953,12 +1028,13 @@ def server_error(e):
 # ==================== START ====================
 if __name__ == '__main__':
     print('=' * 60)
-    print('🚀 ZK SMS Enterprise Backend Server (Flask) v5.0.1')
+    print('🚀 ZK SMS Enterprise Backend Server (Flask) v5.1.0')
     print('=' * 60)
     print(f'📡 Port: {PORT}')
     print(f'🗄️  Supabase: {"✅ Connected" if supabase else "❌ Not configured"}')
     print(f'📨 SMS API: {SMS_API_URL}')
     print(f'👥 Roles: Admin | Agent | Client')
+    print(f'🔒 Auto-filter: Agents & Clients see only their numbers')
     print(f'🕒 Started: {datetime.now().isoformat()}')
     print('=' * 60)
     app.run(host='0.0.0.0', port=PORT)
